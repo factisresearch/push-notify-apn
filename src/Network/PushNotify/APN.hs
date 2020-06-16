@@ -48,7 +48,6 @@ module Network.PushNotify.APN
     ) where
 
 import           Control.Concurrent
-import           Control.Concurrent.QSem
 import           Control.Exception.Lifted (Exception, try, bracket_, throw, throwIO)
 import           Control.Monad
 import           Control.Monad.Except
@@ -58,29 +57,23 @@ import           Data.ByteString                      (ByteString)
 import           Data.Char                            (toLower)
 import           Data.Default                         (def)
 import           Data.Either
-import           Data.Int
 import           Data.IORef
 import           Data.Map.Strict                      (Map)
 import           Data.Maybe
 import           Data.Pool
-import           Data.Semigroup                       ((<>))
 import           Data.Text                            (Text)
 import           Data.Time.Clock
-import           Data.Time.Clock.POSIX
 import           Data.Typeable                        (Typeable)
-import           Data.X509
 import           Data.X509.CertificateStore
 import           GHC.Generics
 import           Network.HTTP2                        (ErrorCodeId,
                                                        toErrorCodeId)
 import           Network.HTTP2.Client
-import           Network.HTTP2.Client.FrameConnection
 import           Network.HTTP2.Client.Helpers
 import           Network.TLS                          hiding (sendData)
 import           Network.TLS.Extra.Cipher
 import           System.IO.Error
 import           System.Mem.Weak
-import           System.Random
 
 import qualified Data.ByteString                      as S
 import qualified Data.ByteString.Base16               as B16
@@ -118,9 +111,6 @@ data ApnConnection = ApnConnection
 
 -- | An APN token used to uniquely identify a device
 newtype ApnToken = ApnToken { unApnToken :: ByteString }
-
-class SpecifyError a where
-    isAnError :: IOError -> a
 
 -- | Create a token from a raw bytestring
 rawToken
@@ -458,10 +448,16 @@ newConnection aci = do
             , clientShared=shared
             , clientHooks=def
                 { onCertificateRequest=const . return . Just $ credential }
-            , clientDebug=DebugParams { debugSeed=Nothing, debugPrintSeed=const $ return () }
+            , clientDebug=DebugParams {
+                             debugSeed=Nothing,
+                             debugPrintSeed=const $ return (),
+                             debugVersionForced=Nothing,
+                             debugKeyLogger=const $ return ()
+                           }
             , clientSupported=def
                 { supportedVersions=[ TLS12 ]
                 , supportedCiphers=ciphersuite_strong }
+            , clientEarlyData=Nothing
             }
 
         conf = [ (HTTP2.SettingsMaxFrameSize, 16384)
@@ -473,7 +469,7 @@ newConnection aci = do
 
         hostname = aciHostname aci
     isOpen <- newIORef True
-    let handleGoAway rsgaf = do
+    let handleGoAway _rsgaf = do
             lift $ writeIORef isOpen False
             return ()
     client <-
@@ -484,7 +480,7 @@ newConnection aci = do
         linkAsyncs client
         return client
     flowWorker <- forkIO $ forever $ do
-        updated <- runClientIO $ _updateWindow $ _incomingFlowControl client
+        _updated <- runClientIO $ _updateWindow $ _incomingFlowControl client
         threadDelay 1000000
     workersem <- newQSem maxConcurrentStreams
     return $ ApnConnection client aci workersem flowWorker isOpen
@@ -577,7 +573,7 @@ sendApnRaw connection token message = bracket_
             handler isfc osfc = do
                 -- sendData client stream (HTTP2.setEndStream) message
                 upload message (HTTP2.setEndHeader . HTTP2.setEndStream) client (_outgoingFlowControl client) stream osfc
-                let pph hStreamId hStream hHeaders hIfc hOfc =
+                let pph _hStreamId _hStream hHeaders _hIfc _hOfc =
                         lift $ print hHeaders
                 response <- waitStream stream isfc pph
                 let (errOrHeaders, frameResponses, _) = response
@@ -597,6 +593,9 @@ sendApnRaw connection token message = bracket_
                             "429" -> decodeReason ApnMessageResultTemporaryError body
                             "500" -> decodeReason ApnMessageResultTemporaryError body
                             "503" -> decodeReason ApnMessageResultTemporaryError body
+                            unknown ->
+                                ApnMessageResultFatalError $
+                                ApnFatalErrorOther (T.pack $ "unhandled status: " ++ show unknown)
         in StreamDefinition init handler
     case res of
         Left _     -> return ApnMessageResultBackoff -- Too much concurrency

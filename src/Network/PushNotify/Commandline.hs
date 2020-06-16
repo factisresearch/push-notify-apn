@@ -6,10 +6,8 @@ module Network.PushNotify.Commandline
     )
 where
 
-import Control.Concurrent
 import Control.Monad
 import Data.Maybe
-import Data.Semigroup ((<>))
 import Options.Applicative
 
 import qualified Data.ByteString.Char8 as B8
